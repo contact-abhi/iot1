@@ -1,14 +1,14 @@
 import React, { useEffect, useRef, useState } from 'react';
 
 import {
-  ActivityIndicator,
-  Dimensions,
-  SafeAreaView,
-  ScrollView,
-  StatusBar,
-  StyleSheet,
-  Text,
-  View,
+    ActivityIndicator,
+    Dimensions,
+    SafeAreaView,
+    ScrollView,
+    StatusBar,
+    StyleSheet,
+    Text,
+    View,
 } from 'react-native';
 
 import { LinearGradient } from 'expo-linear-gradient';
@@ -18,8 +18,8 @@ import * as Notifications from 'expo-notifications';
 import { Ionicons } from '@expo/vector-icons';
 
 import {
-  LineChart,
-  ProgressChart,
+    LineChart,
+    ProgressChart,
 } from 'react-native-chart-kit';
 
 const screenWidth =
@@ -36,6 +36,16 @@ const READ_API_KEY =
 
 const API_URL =
   `https://api.thingspeak.com/channels/${CHANNEL_ID}/feeds.json?results=1&api_key=${READ_API_KEY}`;
+
+/* ESP32 = device activity, not HTTP success. Uses latest feed
+   timestamp + ThingSpeak entry identity (new row vs stale repeat). */
+const POLL_INTERVAL_MS = 8000;
+
+const ESP32_TS_ONLINE_SEC = 20;
+
+const ESP32_TS_OFFLINE_SEC = 30;
+
+const ESP32_NO_NEW_ENTRY_MS = 28000;
 
 /* =======================================================
    NOTIFICATION CONFIG
@@ -108,6 +118,15 @@ export default function HomeScreen() {
   const sensorOnlineSent =
     useRef(false);
 
+  const lastFeedEntryKeyRef =
+    useRef<string | null>(null);
+
+  const lastNewEntryWallMsRef =
+    useRef<number>(0);
+
+  const esp32StableOnlineRef =
+    useRef(false);
+
   /* =======================================================
      USE EFFECT
   ======================================================= */
@@ -123,7 +142,7 @@ export default function HomeScreen() {
 
         fetchThingSpeakData();
 
-      }, 5000);
+      }, POLL_INTERVAL_MS);
 
     return () =>
       clearInterval(interval);
@@ -199,6 +218,10 @@ export default function HomeScreen() {
 
         if (!response.ok) {
 
+          esp32StableOnlineRef.current = false;
+
+          lastFeedEntryKeyRef.current = null;
+
           setConnected(false);
           setSensorActive(false);
           setStatus('THINGSPEAK DISCONNECTED');
@@ -242,31 +265,123 @@ export default function HomeScreen() {
               createdAt.getTime()) /
             1000;
 
-          /* =======================================================
-             SENSOR ACTIVE
-             WAIT MAX 10 SECONDS
-          ======================================================= */
+          const sampleAgeSec =
+            Math.max(0, diffSeconds);
 
-          if (
-            temp &&
-            hum &&
+          const hasFields =
+            !!temp &&
+            !!hum &&
             temp !== 'null' &&
-            hum !== 'null' &&
-            diffSeconds <= 10
+            hum !== 'null';
+
+          const tempNum = hasFields
+            ? parseFloat(temp)
+            : NaN;
+
+          const humNum = hasFields
+            ? parseFloat(hum)
+            : NaN;
+
+          const numsOk =
+            hasFields &&
+            !isNaN(tempNum) &&
+            !isNaN(humNum);
+
+          const rawEntryId =
+            latest.entry_id;
+
+          const entryKey =
+            rawEntryId !== undefined &&
+            rawEntryId !== null &&
+            `${rawEntryId}`.trim() !== ''
+              ? `id:${rawEntryId}`
+              : `ca:${latest.created_at}`;
+
+          const prevEntryKey =
+            lastFeedEntryKeyRef.current;
+
+          const entryChanged =
+            prevEntryKey !== null &&
+            entryKey !== prevEntryKey;
+
+          const wallMsSinceNewEntry =
+            Date.now() -
+            lastNewEntryWallMsRef.current;
+
+          const wallSaysStale =
+            prevEntryKey !== null &&
+            !entryChanged &&
+            wallMsSinceNewEntry >=
+              ESP32_NO_NEW_ENTRY_MS;
+
+          const tsSaysLive =
+            numsOk &&
+            sampleAgeSec <= ESP32_TS_ONLINE_SEC;
+
+          const tsSaysDead =
+            numsOk &&
+            sampleAgeSec >= ESP32_TS_OFFLINE_SEC;
+
+          const activityBurst =
+            numsOk &&
+            entryChanged &&
+            sampleAgeSec <= 24;
+
+          let esp32Online = false;
+
+          if (!numsOk) {
+
+            esp32Online = false;
+          } else if (wallSaysStale || tsSaysDead) {
+
+            esp32Online = false;
+          } else if (
+            tsSaysLive ||
+            activityBurst
           ) {
 
+            esp32Online = true;
+          } else {
+
+            esp32Online =
+              esp32StableOnlineRef.current;
+          }
+
+          esp32StableOnlineRef.current =
+            esp32Online;
+
+          if (entryChanged) {
+
+            lastNewEntryWallMsRef.current =
+              Date.now();
+          }
+
+          if (prevEntryKey === null) {
+
+            lastNewEntryWallMsRef.current =
+              Date.now();
+          }
+
+          lastFeedEntryKeyRef.current =
+            entryKey;
+
+          setLastUpdated(
+            createdAt.toLocaleTimeString()
+          );
+
+          if (esp32Online) {
+
+            sensorOfflineSent.current = false;
+
             setConnected(true);
+
             setSensorActive(true);
 
             setTemperature(temp);
 
             setHumidity(hum);
 
-            setStatus(
-              'LIVE SENSOR STREAM'
-            );
-
-            /* SENSOR ONLINE ALERT */
+            setStatus('LIVE SENSOR STREAM');
 
             if (
               !sensorOnlineSent.current
@@ -278,21 +393,6 @@ export default function HomeScreen() {
               );
 
               sensorOnlineSent.current = true;
-
-              sensorOfflineSent.current = false;
-            }
-
-            const tempNum =
-              parseFloat(temp);
-
-            const humNum =
-              parseFloat(hum);
-
-            if (
-              isNaN(tempNum) ||
-              isNaN(humNum)
-            ) {
-              return;
             }
 
             /* =======================================================
@@ -352,8 +452,6 @@ export default function HomeScreen() {
               highHumAlertSent.current = true;
             }
 
-            /* RESET ALERTS */
-
             if (humNum >= 40) {
 
               lowHumAlertSent.current = false;
@@ -363,10 +461,6 @@ export default function HomeScreen() {
 
               highHumAlertSent.current = false;
             }
-
-            /* =======================================================
-               TEMP HISTORY
-            ======================================================= */
 
             setTempHistory(prev => {
 
@@ -385,10 +479,6 @@ export default function HomeScreen() {
               return updated;
             });
 
-            /* =======================================================
-               HUM HISTORY
-            ======================================================= */
-
             setHumHistory(prev => {
 
               const updated =
@@ -406,10 +496,6 @@ export default function HomeScreen() {
               return updated;
             });
 
-            /* =======================================================
-               TIME LABELS
-            ======================================================= */
-
             setTimeLabels(prev => {
 
               const currentTime =
@@ -426,22 +512,19 @@ export default function HomeScreen() {
                 ...prev,
                 currentTime,
               ].slice(-10);
-
             });
+          } else if (numsOk) {
 
-          }
-
-          /* =======================================================
-             SENSOR OFFLINE
-          ======================================================= */
-
-          else {
+            setConnected(false);
 
             setSensorActive(false);
-          setConnected(false);
+
+            setTemperature(temp);
+
+            setHumidity(hum);
 
             setStatus(
-              'SENSOR STOPPED'
+              'ESP32 OFFLINE · STALE LAST READ'
             );
 
             if (
@@ -453,8 +536,26 @@ export default function HomeScreen() {
                 'ESP32 stopped sending data.'
               );
 
-              /* CLEAR VALUES ONLY
-                 AFTER OFFLINE ALERT */
+              sensorOfflineSent.current = true;
+
+              sensorOnlineSent.current = false;
+            }
+          } else {
+
+            setSensorActive(false);
+
+            setConnected(false);
+
+            setStatus('SENSOR STOPPED');
+
+            if (
+              !sensorOfflineSent.current
+            ) {
+
+              sendNotification(
+                '❌ SENSOR OFFLINE',
+                'ESP32 stopped sending data.'
+              );
 
               setTemperature('----');
 
@@ -465,11 +566,12 @@ export default function HomeScreen() {
               sensorOnlineSent.current = false;
             }
           }
-
-          setLastUpdated(
-            createdAt.toLocaleTimeString()
-          );
         } else {
+
+          esp32StableOnlineRef.current = false;
+
+          lastFeedEntryKeyRef.current = null;
+
           setConnected(false);
           setSensorActive(false);
           setStatus('THINGSPEAK NO DATA');
@@ -491,6 +593,10 @@ export default function HomeScreen() {
       } catch (error) {
 
         console.log(error);
+
+        esp32StableOnlineRef.current = false;
+
+        lastFeedEntryKeyRef.current = null;
 
         setConnected(false);
 
@@ -567,10 +673,9 @@ export default function HomeScreen() {
               style={[
                 styles.liveBadge,
                 {
-                  borderColor:
-                    connected
-                      ? 'rgba(0,255,136,0.4)'
-                      : 'rgba(148,163,184,0.3)',
+                  borderColor: connected
+                    ? 'rgba(0,255,136,0.4)'
+                    : 'rgba(255,59,48,0.45)',
                 },
               ]}
             >
@@ -579,10 +684,9 @@ export default function HomeScreen() {
                 style={[
                   styles.liveDot,
                   {
-                    backgroundColor:
-                      connected
-                        ? '#00FF88'
-                        : '#94A3B8',
+                    backgroundColor: connected
+                      ? '#00FF88'
+                      : '#FF3B30',
                   },
                 ]}
               />
@@ -591,10 +695,9 @@ export default function HomeScreen() {
                 style={[
                   styles.liveText,
                   {
-                    color:
-                      connected
-                        ? '#00FF88'
-                        : '#94A3B8',
+                    color: connected
+                      ? '#00FF88'
+                      : '#FF3B30',
                   },
                 ]}
               >
@@ -689,9 +792,7 @@ export default function HomeScreen() {
                 }
                 size={24}
                 color={
-                  sensorActive
-                    ? '#00FF88'
-                    : '#94A3B8'
+                  sensorActive ? '#00FF88' : '#FF3B30'
                 }
               />
 
